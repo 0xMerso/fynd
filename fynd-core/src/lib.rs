@@ -32,6 +32,8 @@ pub mod feed;
 pub(crate) mod graph;
 /// External price validation for quotes.
 pub mod price_guard;
+/// Slippage prediction and route reliability scoring.
+pub mod slippage;
 /// [`FyndBuilder`](solver::FyndBuilder) assembles the full pipeline and returns a
 /// [`Solver`](solver::Solver).
 pub mod solver;

@@ -9,6 +9,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -27,6 +28,7 @@ use crate::{
     derived::{computation::ComputationRequirements, types::TokenGasPrices, SharedDerivedDataRef},
     feed::market_data::{SharedMarketData, SharedMarketDataRef},
     graph::{petgraph::StableDiGraph, Path, PetgraphStableDiGraphManager},
+    slippage::SlippagePredictor,
     types::{ComponentId, Order, Route, RouteResult, Swap},
     AlgorithmError,
 };
@@ -36,6 +38,7 @@ pub struct MostLiquidAlgorithm {
     max_hops: usize,
     timeout: Duration,
     max_routes: Option<usize>,
+    slippage_predictor: Option<Arc<dyn SlippagePredictor>>,
 }
 
 /// Algorithm-specific edge data for liquidity-based routing.
@@ -185,7 +188,13 @@ impl crate::graph::EdgeWeightFromSimAndDerived for DepthAndPrice {
 impl MostLiquidAlgorithm {
     /// Creates a new MostLiquidAlgorithm with default settings.
     pub fn new() -> Self {
-        Self { min_hops: 1, max_hops: 3, timeout: Duration::from_millis(500), max_routes: None }
+        Self {
+            min_hops: 1,
+            max_hops: 3,
+            timeout: Duration::from_millis(500),
+            max_routes: None,
+            slippage_predictor: None,
+        }
     }
 
     /// Creates a new MostLiquidAlgorithm with custom settings.
@@ -195,7 +204,14 @@ impl MostLiquidAlgorithm {
             max_hops: config.max_hops(),
             timeout: config.timeout(),
             max_routes: config.max_routes(),
+            slippage_predictor: None,
         })
+    }
+
+    /// Sets the slippage predictor for risk-adjusted route selection.
+    pub fn with_slippage_predictor(mut self, predictor: Arc<dyn SlippagePredictor>) -> Self {
+        self.slippage_predictor = Some(predictor);
+        self
     }
 
     /// Finds all paths between two tokens using BFS directly on the graph.
@@ -437,6 +453,65 @@ impl MostLiquidAlgorithm {
 
         Ok(RouteResult::new(route, net_amount_out, gas_price))
     }
+
+    /// Scores a simulated route for comparison.
+    ///
+    /// When no predictor is set, returns the raw `net_amount_out` as f64.
+    /// When a predictor is set, multiplies by expected delivery (product of
+    /// per-pool `1 - expected_slippage`).
+    fn score_route(
+        &self,
+        result: &RouteResult,
+        market: &SharedMarketData,
+        pool_depths: &Option<crate::derived::types::PoolDepths>,
+    ) -> f64 {
+        let raw = result
+            .net_amount_out()
+            .to_f64()
+            .unwrap_or(f64::NEG_INFINITY);
+
+        let Some(predictor) = &self.slippage_predictor else {
+            return raw;
+        };
+
+        let mut expected_delivery = 1.0;
+
+        for swap in result.route().swaps() {
+            let fee = market
+                .get_simulation_state(swap.component_id())
+                .map(|s| s.fee())
+                .unwrap_or(0.0);
+
+            let utilization = pool_depths
+                .as_ref()
+                .and_then(|depths| {
+                    let key = (
+                        swap.component_id().to_string(),
+                        swap.token_in().clone(),
+                        swap.token_out().clone(),
+                    );
+                    depths.get(&key)
+                })
+                .and_then(|depth| depth.to_f64())
+                .and_then(|depth| {
+                    if depth > 0.0 {
+                        swap.amount_in()
+                            .to_f64()
+                            .map(|amt| (amt / depth).min(1.0))
+                    } else {
+                        Some(1.0)
+                    }
+                })
+                .unwrap_or(1.0);
+
+            let features = crate::slippage::PoolSlippageFeatures { utilization, fee };
+
+            let prediction = predictor.predict(&features);
+            expected_delivery *= 1.0 - prediction.expected_slippage;
+        }
+
+        raw * expected_delivery
+    }
 }
 
 impl Default for MostLiquidAlgorithm {
@@ -469,15 +544,13 @@ impl Algorithm for MostLiquidAlgorithm {
             return Err(AlgorithmError::ExactOutNotSupported);
         }
 
-        // Extract token prices from derived data (if available)
-        let token_prices = if let Some(ref derived) = derived {
-            derived
-                .read()
-                .await
-                .token_prices()
-                .cloned()
+        // ToDo: make sure the .read().await does not cost significant time
+        // Extract token prices and pool depths from derived data (if available)
+        let (token_prices, pool_depths) = if let Some(ref derived) = derived {
+            let guard = derived.read().await;
+            (guard.token_prices().cloned(), guard.pool_depths().cloned())
         } else {
-            None
+            (None, None)
         };
 
         let amount_in = order.amount().clone();
@@ -557,6 +630,7 @@ impl Algorithm for MostLiquidAlgorithm {
 
         // Step 5: Simulate all paths in score order using the local market subset
         let mut best: Option<RouteResult> = None;
+        let mut best_score: Option<f64> = None;
         let timeout_ms = self.timeout.as_millis() as u64;
 
         for (edge_path, _) in scored_paths {
@@ -581,12 +655,13 @@ impl Algorithm for MostLiquidAlgorithm {
             };
 
             // Check if this is the best result so far
-            if best
-                .as_ref()
-                .map(|best| result.net_amount_out() > best.net_amount_out())
+            let score = self.score_route(&result, &market, &pool_depths);
+            if best_score
+                .map(|bs| score > bs)
                 .unwrap_or(true)
             {
                 best = Some(result);
+                best_score = Some(score);
             }
 
             paths_simulated += 1;

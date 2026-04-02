@@ -8,3 +8,7 @@ scale_results*.json
 .env
 .claude/worktrees/
 .claude/plans/
+
+# Added by Merso
+merso/*
+!merso/SPECS.md
