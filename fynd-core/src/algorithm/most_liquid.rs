@@ -28,7 +28,10 @@ use crate::{
     derived::{computation::ComputationRequirements, types::TokenGasPrices, SharedDerivedDataRef},
     feed::market_data::{SharedMarketData, SharedMarketDataRef},
     graph::{petgraph::StableDiGraph, Path, PetgraphStableDiGraphManager},
-    slippage::SlippagePredictor,
+    slippage::{
+        PoolSlippageFeatures, ReliabilityConfig, RouteStats, SlippagePredictor,
+        risk_adjusted_amount,
+    },
     types::{ComponentId, Order, Route, RouteResult, Swap},
     AlgorithmError,
 };
@@ -39,6 +42,7 @@ pub struct MostLiquidAlgorithm {
     timeout: Duration,
     max_routes: Option<usize>,
     slippage_predictor: Option<Arc<dyn SlippagePredictor>>,
+    reliability_config: ReliabilityConfig,
 }
 
 /// Algorithm-specific edge data for liquidity-based routing.
@@ -194,6 +198,7 @@ impl MostLiquidAlgorithm {
             timeout: Duration::from_millis(500),
             max_routes: None,
             slippage_predictor: None,
+            reliability_config: ReliabilityConfig::default(),
         }
     }
 
@@ -205,12 +210,18 @@ impl MostLiquidAlgorithm {
             timeout: config.timeout(),
             max_routes: config.max_routes(),
             slippage_predictor: None,
+            reliability_config: ReliabilityConfig::default(),
         })
     }
 
     /// Sets the slippage predictor for risk-adjusted route selection.
-    pub fn with_slippage_predictor(mut self, predictor: Arc<dyn SlippagePredictor>) -> Self {
+    pub fn with_slippage_predictor(
+        mut self,
+        predictor: Arc<dyn SlippagePredictor>,
+        config: ReliabilityConfig,
+    ) -> Self {
         self.slippage_predictor = Some(predictor);
+        self.reliability_config = config;
         self
     }
 
@@ -474,7 +485,7 @@ impl MostLiquidAlgorithm {
             return raw;
         };
 
-        let mut expected_delivery = 1.0;
+        let mut stats = RouteStats::new();
 
         for swap in result.route().swaps() {
             let fee = market
@@ -504,13 +515,11 @@ impl MostLiquidAlgorithm {
                 })
                 .unwrap_or(1.0);
 
-            let features = crate::slippage::PoolSlippageFeatures { utilization, fee };
-
-            let prediction = predictor.predict(&features);
-            expected_delivery *= 1.0 - prediction.expected_slippage;
+            let features = PoolSlippageFeatures { utilization, fee };
+            stats.add_pool(&predictor.predict(&features));
         }
 
-        raw * expected_delivery
+        risk_adjusted_amount(raw, &stats, 0.0, &self.reliability_config)
     }
 }
 
