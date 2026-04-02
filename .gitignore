@@ -11,4 +11,3 @@ scale_results*.json
 
 # Added by Merso
 merso/*
-!merso/SPECS.md

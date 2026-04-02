@@ -29,8 +29,8 @@ use crate::{
     feed::market_data::{SharedMarketData, SharedMarketDataRef},
     graph::{petgraph::StableDiGraph, Path, PetgraphStableDiGraphManager},
     slippage::{
-        PoolSlippageFeatures, ReliabilityConfig, RouteStats, SlippagePredictor,
-        risk_adjusted_amount,
+        risk_adjusted_amount, PoolSlippageFeatures, ReliabilityConfig, RouteStats,
+        SlippagePredictor,
     },
     types::{ComponentId, Order, Route, RouteResult, Swap},
     AlgorithmError,
@@ -2135,4 +2135,46 @@ mod tests {
             Err(AlgorithmError::InvalidConfiguration { reason }) if reason.contains("cannot exceed")
         ));
     }
+
+    // Spec test 5: MostLiquidAlgorithm with a ConstantPredictor produces the same
+    // result as without a predictor when lambda=0.
+    //
+    #[tokio::test]
+    async fn test_constant_predictor_lambda_zero_matches_no_predictor() {
+        let token_a = token(0x01, "A");
+        let token_b = token(0x02, "B");
+
+        let (market, manager) =
+            setup_market(vec![("pool1", &token_a, &token_b, MockProtocolSim::new(2.0))]);
+
+        let config = AlgorithmConfig::new(1, 1, Duration::from_millis(100), None).unwrap();
+        let order = order(&token_a, &token_b, ONE_ETH, OrderSide::Sell);
+
+        // Without predictor
+        let algo_without = MostLiquidAlgorithm::with_config(config.clone()).unwrap();
+        let result_without = algo_without
+            .find_best_route(manager.graph(), market.clone(), None, &order)
+            .await
+            .unwrap();
+
+        // With ConstantPredictor(0.0) + lambda=0
+        let algo_with = MostLiquidAlgorithm::with_config(config)
+            .unwrap()
+            .with_slippage_predictor(
+                Arc::new(crate::slippage::ConstantPredictor::new(0.0)),
+                crate::slippage::ReliabilityConfig { lambda: 0.0 },
+            );
+        let result_with = algo_with
+            .find_best_route(manager.graph(), market, None, &order)
+            .await
+            .unwrap();
+
+        assert_eq!(result_without.net_amount_out(), result_with.net_amount_out());
+        assert_eq!(result_without.route().swaps().len(), result_with.route().swaps().len());
+    }
+
+    // Note: a LinearPredictor integration test would require DerivedData with pool depths
+    // set up so utilization varies per pool. Without pool depths, utilization
+    // defaults to 1.0 for all pools, making LinearPredictor equivalent to Constant.
+    // (and LinearPredictor is covered by its own unit tests in predictors/linear.rs)
 }
