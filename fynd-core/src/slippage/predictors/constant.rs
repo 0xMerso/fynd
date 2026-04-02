@@ -1,4 +1,4 @@
-use super::predictor::{PoolSlippageFeatures, SlippagePrediction, SlippagePredictor};
+use crate::slippage::{PoolSlippageFeatures, SlippagePrediction, SlippagePredictor};
 
 /// Returns the same hardcoded slippage for every pool.
 /// Useful as a baseline and for tests.
