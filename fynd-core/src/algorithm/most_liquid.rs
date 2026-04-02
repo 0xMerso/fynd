@@ -9,6 +9,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -27,6 +28,10 @@ use crate::{
     derived::{computation::ComputationRequirements, types::TokenGasPrices, SharedDerivedDataRef},
     feed::market_data::{SharedMarketData, SharedMarketDataRef},
     graph::{petgraph::StableDiGraph, Path, PetgraphStableDiGraphManager},
+    slippage::{
+        risk_adjusted_amount, PoolSlippageFeatures, ReliabilityConfig, RouteStats,
+        SlippagePredictor,
+    },
     types::{ComponentId, Order, Route, RouteResult, Swap},
     AlgorithmError,
 };
@@ -36,6 +41,8 @@ pub struct MostLiquidAlgorithm {
     max_hops: usize,
     timeout: Duration,
     max_routes: Option<usize>,
+    slippage_predictor: Option<Arc<dyn SlippagePredictor>>,
+    reliability_config: ReliabilityConfig,
 }
 
 /// Algorithm-specific edge data for liquidity-based routing.
@@ -185,7 +192,14 @@ impl crate::graph::EdgeWeightFromSimAndDerived for DepthAndPrice {
 impl MostLiquidAlgorithm {
     /// Creates a new MostLiquidAlgorithm with default settings.
     pub fn new() -> Self {
-        Self { min_hops: 1, max_hops: 3, timeout: Duration::from_millis(500), max_routes: None }
+        Self {
+            min_hops: 1,
+            max_hops: 3,
+            timeout: Duration::from_millis(500),
+            max_routes: None,
+            slippage_predictor: None,
+            reliability_config: ReliabilityConfig::default(),
+        }
     }
 
     /// Creates a new MostLiquidAlgorithm with custom settings.
@@ -195,7 +209,20 @@ impl MostLiquidAlgorithm {
             max_hops: config.max_hops(),
             timeout: config.timeout(),
             max_routes: config.max_routes(),
+            slippage_predictor: None,
+            reliability_config: ReliabilityConfig::default(),
         })
+    }
+
+    /// Sets the slippage predictor for risk-adjusted route selection.
+    pub fn with_slippage_predictor(
+        mut self,
+        predictor: Arc<dyn SlippagePredictor>,
+        config: ReliabilityConfig,
+    ) -> Self {
+        self.slippage_predictor = Some(predictor);
+        self.reliability_config = config;
+        self
     }
 
     /// Finds all paths between two tokens using BFS directly on the graph.
@@ -437,6 +464,63 @@ impl MostLiquidAlgorithm {
 
         Ok(RouteResult::new(route, net_amount_out, gas_price))
     }
+
+    /// Scores a simulated route for comparison.
+    ///
+    /// When no predictor is set, returns the raw `net_amount_out` as f64.
+    /// When a predictor is set, multiplies by expected delivery (product of
+    /// per-pool `1 - expected_slippage`).
+    fn score_route(
+        &self,
+        result: &RouteResult,
+        market: &SharedMarketData,
+        pool_depths: &Option<crate::derived::types::PoolDepths>,
+    ) -> f64 {
+        let raw = result
+            .net_amount_out()
+            .to_f64()
+            .unwrap_or(f64::NEG_INFINITY);
+
+        let Some(predictor) = &self.slippage_predictor else {
+            return raw;
+        };
+
+        let mut stats = RouteStats::new();
+
+        for swap in result.route().swaps() {
+            let fee = market
+                .get_simulation_state(swap.component_id())
+                .map(|s| s.fee())
+                .unwrap_or(0.0);
+
+            let utilization = pool_depths
+                .as_ref()
+                .and_then(|depths| {
+                    let key = (
+                        swap.component_id().to_string(),
+                        swap.token_in().clone(),
+                        swap.token_out().clone(),
+                    );
+                    depths.get(&key)
+                })
+                .and_then(|depth| depth.to_f64())
+                .and_then(|depth| {
+                    if depth > 0.0 {
+                        swap.amount_in()
+                            .to_f64()
+                            .map(|amt| (amt / depth).min(1.0))
+                    } else {
+                        Some(1.0)
+                    }
+                })
+                .unwrap_or(1.0);
+
+            let features = PoolSlippageFeatures { utilization, fee };
+            stats.add_pool(&predictor.predict(&features));
+        }
+
+        risk_adjusted_amount(raw, &stats, 0.0, &self.reliability_config)
+    }
 }
 
 impl Default for MostLiquidAlgorithm {
@@ -469,15 +553,13 @@ impl Algorithm for MostLiquidAlgorithm {
             return Err(AlgorithmError::ExactOutNotSupported);
         }
 
-        // Extract token prices from derived data (if available)
-        let token_prices = if let Some(ref derived) = derived {
-            derived
-                .read()
-                .await
-                .token_prices()
-                .cloned()
+        // ToDo: make sure the .read().await does not cost significant time
+        // Extract token prices and pool depths from derived data (if available)
+        let (token_prices, pool_depths) = if let Some(ref derived) = derived {
+            let guard = derived.read().await;
+            (guard.token_prices().cloned(), guard.pool_depths().cloned())
         } else {
-            None
+            (None, None)
         };
 
         let amount_in = order.amount().clone();
@@ -557,6 +639,7 @@ impl Algorithm for MostLiquidAlgorithm {
 
         // Step 5: Simulate all paths in score order using the local market subset
         let mut best: Option<RouteResult> = None;
+        let mut best_score: Option<f64> = None;
         let timeout_ms = self.timeout.as_millis() as u64;
 
         for (edge_path, _) in scored_paths {
@@ -581,12 +664,13 @@ impl Algorithm for MostLiquidAlgorithm {
             };
 
             // Check if this is the best result so far
-            if best
-                .as_ref()
-                .map(|best| result.net_amount_out() > best.net_amount_out())
+            let score = self.score_route(&result, &market, &pool_depths);
+            if best_score
+                .map(|bs| score > bs)
                 .unwrap_or(true)
             {
                 best = Some(result);
+                best_score = Some(score);
             }
 
             paths_simulated += 1;
@@ -2051,4 +2135,46 @@ mod tests {
             Err(AlgorithmError::InvalidConfiguration { reason }) if reason.contains("cannot exceed")
         ));
     }
+
+    // Spec test 5: MostLiquidAlgorithm with a ConstantPredictor produces the same
+    // result as without a predictor when lambda=0.
+    //
+    #[tokio::test]
+    async fn test_constant_predictor_lambda_zero_matches_no_predictor() {
+        let token_a = token(0x01, "A");
+        let token_b = token(0x02, "B");
+
+        let (market, manager) =
+            setup_market(vec![("pool1", &token_a, &token_b, MockProtocolSim::new(2.0))]);
+
+        let config = AlgorithmConfig::new(1, 1, Duration::from_millis(100), None).unwrap();
+        let order = order(&token_a, &token_b, ONE_ETH, OrderSide::Sell);
+
+        // Without predictor
+        let algo_without = MostLiquidAlgorithm::with_config(config.clone()).unwrap();
+        let result_without = algo_without
+            .find_best_route(manager.graph(), market.clone(), None, &order)
+            .await
+            .unwrap();
+
+        // With ConstantPredictor(0.0) + lambda=0
+        let algo_with = MostLiquidAlgorithm::with_config(config)
+            .unwrap()
+            .with_slippage_predictor(
+                Arc::new(crate::slippage::ConstantPredictor::new(0.0)),
+                crate::slippage::ReliabilityConfig { lambda: 0.0 },
+            );
+        let result_with = algo_with
+            .find_best_route(manager.graph(), market, None, &order)
+            .await
+            .unwrap();
+
+        assert_eq!(result_without.net_amount_out(), result_with.net_amount_out());
+        assert_eq!(result_without.route().swaps().len(), result_with.route().swaps().len());
+    }
+
+    // Note: a LinearPredictor integration test would require DerivedData with pool depths
+    // set up so utilization varies per pool. Without pool depths, utilization
+    // defaults to 1.0 for all pools, making LinearPredictor equivalent to Constant.
+    // (and LinearPredictor is covered by its own unit tests in predictors/linear.rs)
 }
