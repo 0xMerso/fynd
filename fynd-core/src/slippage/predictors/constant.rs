@@ -27,8 +27,10 @@ mod tests {
     fn returns_configured_slippage_for_any_input() {
         let predictor = ConstantPredictor::new(0.05);
 
-        let features_low = PoolSlippageFeatures { utilization: 0.1, fee: 0.003 };
-        let features_high = PoolSlippageFeatures { utilization: 0.9, fee: 0.01 };
+        let features_low =
+            PoolSlippageFeatures { utilization: 0.1, fee: 0.003, pool_key: None, depth: None };
+        let features_high =
+            PoolSlippageFeatures { utilization: 0.9, fee: 0.01, pool_key: None, depth: None };
 
         let pred_low = predictor.predict(&features_low);
         let pred_high = predictor.predict(&features_high);

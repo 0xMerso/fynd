@@ -1,3 +1,5 @@
+use crate::derived::types::PoolDepths;
+
 /// Per-pool signals available from `SharedMarketData` and `DerivedData`
 /// that could predict next-block slippage.
 #[derive(Debug, Clone)]
@@ -7,6 +9,10 @@ pub struct PoolSlippageFeatures {
     pub utilization: f64,
     /// Pool fee from `ProtocolSim::fee()`, e.g. 0.003 for 0.3%.
     pub fee: f64,
+    /// Pool identifier for volatility lookups. None for predictors that don't need it.
+    pub pool_key: Option<crate::derived::types::PoolDepthKey>,
+    /// Raw pool depth as f64. None when depth is unavailable.
+    pub depth: Option<f64>,
 }
 
 /// Slippage prediction for a single pool.
@@ -24,4 +30,7 @@ pub struct SlippagePrediction {
 pub trait SlippagePredictor: Send + Sync {
     /// Returns a slippage prediction for a single pool.
     fn predict(&self, features: &PoolSlippageFeatures) -> SlippagePrediction;
+
+    /// Ingests new pool depth data for a block. Default no-op for static predictors.
+    fn update(&self, _pool_depths: &PoolDepths, _block: u64) {}
 }

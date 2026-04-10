@@ -49,7 +49,8 @@ mod tests {
     #[test]
     fn low_utilization_low_slippage() {
         let predictor = LinearPredictor::default_weights();
-        let features = PoolSlippageFeatures { utilization: 0.1, fee: 0.003 };
+        let features =
+            PoolSlippageFeatures { utilization: 0.1, fee: 0.003, pool_key: None, depth: None };
         let prediction = predictor.predict(&features);
 
         assert!(prediction.expected_slippage < 0.3);
@@ -59,7 +60,8 @@ mod tests {
     #[test]
     fn high_utilization_high_slippage() {
         let predictor = LinearPredictor::default_weights();
-        let features = PoolSlippageFeatures { utilization: 0.9, fee: 0.003 };
+        let features =
+            PoolSlippageFeatures { utilization: 0.9, fee: 0.003, pool_key: None, depth: None };
         let prediction = predictor.predict(&features);
 
         assert!(prediction.expected_slippage > 0.5);
@@ -68,8 +70,10 @@ mod tests {
     #[test]
     fn high_fee_reduces_slippage() {
         let predictor = LinearPredictor::default_weights();
-        let low_fee = PoolSlippageFeatures { utilization: 0.5, fee: 0.001 };
-        let high_fee = PoolSlippageFeatures { utilization: 0.5, fee: 0.01 };
+        let low_fee =
+            PoolSlippageFeatures { utilization: 0.5, fee: 0.001, pool_key: None, depth: None };
+        let high_fee =
+            PoolSlippageFeatures { utilization: 0.5, fee: 0.01, pool_key: None, depth: None };
 
         let pred_low = predictor.predict(&low_fee);
         let pred_high = predictor.predict(&high_fee);
@@ -80,7 +84,8 @@ mod tests {
     #[test]
     fn output_clamped_to_unit_range() {
         let predictor = LinearPredictor::new(10.0, 10.0);
-        let features = PoolSlippageFeatures { utilization: 1.0, fee: 0.0 };
+        let features =
+            PoolSlippageFeatures { utilization: 1.0, fee: 0.0, pool_key: None, depth: None };
         let prediction = predictor.predict(&features);
 
         assert!(prediction.expected_slippage <= 1.0);
