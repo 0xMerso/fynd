@@ -493,17 +493,18 @@ impl MostLiquidAlgorithm {
                 .map(|s| s.fee())
                 .unwrap_or(0.0);
 
-            let utilization = pool_depths
+            let pool_key = (
+                swap.component_id().to_string(),
+                swap.token_in().clone(),
+                swap.token_out().clone(),
+            );
+
+            let depth_f64 = pool_depths
                 .as_ref()
-                .and_then(|depths| {
-                    let key = (
-                        swap.component_id().to_string(),
-                        swap.token_in().clone(),
-                        swap.token_out().clone(),
-                    );
-                    depths.get(&key)
-                })
-                .and_then(|depth| depth.to_f64())
+                .and_then(|depths| depths.get(&pool_key))
+                .and_then(|d| d.to_f64());
+
+            let utilization = depth_f64
                 .and_then(|depth| {
                     if depth > 0.0 {
                         swap.amount_in()
@@ -515,7 +516,12 @@ impl MostLiquidAlgorithm {
                 })
                 .unwrap_or(1.0);
 
-            let features = PoolSlippageFeatures { utilization, fee };
+            let features = PoolSlippageFeatures {
+                utilization,
+                fee,
+                pool_key: Some(pool_key),
+                depth: depth_f64,
+            };
             stats.add_pool(&predictor.predict(&features));
         }
 
@@ -557,7 +563,13 @@ impl Algorithm for MostLiquidAlgorithm {
         // Extract token prices and pool depths from derived data (if available)
         let (token_prices, pool_depths) = if let Some(ref derived) = derived {
             let guard = derived.read().await;
-            (guard.token_prices().cloned(), guard.pool_depths().cloned())
+            let depths = guard.pool_depths().cloned();
+            if let (Some(predictor), Some(ref d), Some(block)) =
+                (&self.slippage_predictor, &depths, guard.pool_depths_block())
+            {
+                predictor.update(d, block);
+            }
+            (guard.token_prices().cloned(), depths)
         } else {
             (None, None)
         };
